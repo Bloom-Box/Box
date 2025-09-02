@@ -1,198 +1,123 @@
+// Receiver.ino
 #include <WiFi.h>
-#include <stdio.h>
-#include <vector>
-#include <DHT.h>
-#include <esp_system.h>
+#include <esp_now.h>
+#include <Update.h>
+#include <mbedtls/sha256.h>
+#include "Packet.h"
 
-// === CONFIG ===
-namespace wlan {
-    const String ssid = "NorthernLight";
-    const String password = "BloomBox";
+static uint32_t expectedSeq=0;
+static mbedtls_sha256_context sha;
+static uint8_t offerHash[32];
+static bool hashing=false;
+
+static uint16_t crc16(const uint8_t* d,size_t n){
+  uint16_t c=0xFFFF; for(size_t i=0;i<n;i++){ c^=(uint16_t)d[i]<<8; for(int j=0;j<8;j++) c=(c&0x8000)?(c<<1)^0x1021:(c<<1); }
+  return c;
+}
+static void sendAck(const uint8_t* mac,uint32_t next){
+  AckPacket a; a.nextExpected = next; uint8_t buf[8]; 
+  esp_now_send(mac, buf, a.serialize(buf));
+}
+static void sendControl(const uint8_t* mac, Type t) {
+  ControlPacket c (t); uint8_t buf[1];
+  esp_now_send(mac, buf, c.serialize(buf));
 }
 
-namespace backend {
-    const char* address = "192.168.4.3";
-    const int port = 28878;
-}
 
-#define PUMP_PIN 0
-#define LIGHT_PIN 17
-#define DHT_PIN 5
-#define MOISTURE_SENSOR_PIN 34
+void onRecv(const uint8_t* mac,const uint8_t* data,int len) {
 
-DHT dht(DHT_PIN, DHT22);
+  if (len<1) return;
 
-// === TOOLS ===
+  Packet* pkt = Packet::parse(data,len);
+  if (!pkt) return;
 
-std::vector<std::string> split(std::string s, std::string delimiter) {
-    size_t pos_start = 0, pos_end, delim_len = delimiter.length();
-    std::string token;
-    std::vector<std::string> res;
+  switch (pkt->type()) {
 
-    while ((pos_end = s.find(delimiter, pos_start)) != std::string::npos) {
-        token = s.substr(pos_start, pos_end - pos_start);
-        pos_start = pos_end + delim_len;
-        res.push_back(token);
-    }
+    case Type::OFFER: {
 
-    res.push_back(s.substr(pos_start));
-    return res;
-}
+      auto* o = static_cast<OfferPacket*>(pkt);
 
-const char* get_reset_reason(int reason) {
-    switch (reason) {
-        case 1 : return "POWERON_RESET";
-        case 3 : return "SW_RESET";
-        case 4 : return "OWDT_RESET";
-        case 5 : return "DEEPSLEEP_RESET";
-        case 6 : return "SDIO_RESET";
-        case 7 : return "TG0WDT_SYS_RESET";
-        case 8 : return "TG1WDT_SYS_RESET";
-        case 9 : return "RTCWDT_SYS_RESET";
-        case 10: return "INTRUSION_RESET";
-        case 11: return "TGWDT_CPU_RESET";
-        case 12: return "SW_CPU_RESET";
-        case 13: return "RTCWDT_CPU_RESET";
-        case 14: return "EXT_CPU_RESET";
-        case 15: return "RTCWDT_BROWN_OUT_RESET";
-        case 16: return "RTCWDT_RTC_RESET";
-        default: return "NO_MEAN";
-    }
-}
+      expectedSeq=0;
 
-// === NETWORK ===
+      memcpy(offerHash, o->sha256, 32);
 
-WiFiClient server;
+      if (Update.begin(o->size)) {
 
-unsigned long lastWiFiAttempt = 0;
-unsigned long lastServerAttempt = 0;
-const unsigned long reconnectInterval = 5000;
+        mbedtls_sha256_init(&sha); 
+        mbedtls_sha256_starts_ret(&sha, 0); 
+        hashing=true;
 
-void connectToWiFi() {
-    if (WiFi.status() == WL_CONNECTED) return;
+        sendControl(mac, Type::FINISH);
 
-    Serial.printf("Connecting to '%s'", wlan::ssid.c_str());
-    WiFi.begin(wlan::ssid.c_str(), wlan::password.c_str());
+      } else sendControl(mac, Type::REJECT);
 
-    unsigned long start = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - start < 10000) {
-        Serial.print(".");
-        delay(500);
-    }
+      break;
 
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println(" - Connected!");
-    } else {
-        Serial.println(" - Failed to connect to WiFi.");
-    }
-}
+    } 
 
-void connectToServer() {
-    if (server.connected()) return;
+    case Type::DATA: {
 
-    Serial.printf("Connecting to %s:%d. ", backend::address, backend::port);
+      auto* d = static_cast<DataPacket*>(pkt);
 
-    server.stop();  // Clean up before reconnect
-    if (server.connect(backend::address, backend::port)) {
-        server.println("MAC|" + WiFi.macAddress());
-        Serial.println(" - Connected!");
-    } else {
-        Serial.println(" - Failed!");
-    }
-}
+      if (d->seq != expectedSeq || crc16(d->bytes, d->len) != d->crc16) { sendAck(mac, expectedSeq); break; }
 
-// === LOGGING ===
+      size_t w = Update.write(d->bytes,d->len);
+      if (w != d->len) { sendControl(mac, Type::CANCEL); break; }
 
-void log(String level, String message) {
-    Serial.println("[" + level + "] " + message);
-    if (server.connected()) {
-        server.println("LOG|" + level + "|" + message);
-    }
-}
+      if (hashing) mbedtls_sha256_update_ret(&sha, d->bytes, d->len);
 
-// === MAIN LOOP ===
+      expectedSeq++;
 
-void loop() {
-    unsigned long now = millis();
+      sendAck(mac, expectedSeq);
 
-    if (WiFi.status() != WL_CONNECTED) {
-        if (now - lastWiFiAttempt >= reconnectInterval) {
-            lastWiFiAttempt = now;
-            connectToWiFi();
-        }
-        return;
-    }
+      break;
 
-    if (!server.connected()) {
-        if (now - lastServerAttempt >= reconnectInterval) {
-            lastServerAttempt = now;
-            connectToServer();
-        }
-        return;
-    }
+    } 
 
-    while (server.available()) {
-        String message = server.readStringUntil('\n');
-        message.trim();
-        Serial.println("[Server] " + message);
-        std::vector<std::string> args = split(message.c_str(), " ");
+    case Type::FINISH: {
 
-        if (args.empty()) {
-            log("WARN", "Received empty message");
-            continue;
+        if (hashing) { 
+
+            uint8_t calc[32]; 
+            mbedtls_sha256_finish_ret(&sha, calc); 
+
+            hashing = false; 
+
+            if (memcmp(calc, offerHash, 32) != 0) return sendControl(mac, Type::CANCEL);
+
         }
 
-        else if (args[0] == "DATA") {
-            float humidity = dht.readHumidity();
-            float temperature = dht.readTemperature();
+        if (!Update.end(true)) return sendControl(mac, Type::CANCEL);
 
-            if (isnan(humidity) || isnan(temperature)) {
-                log("ERROR", "Failed to read from DHT sensor");
-                continue;
-            }
+        sendControl(mac, Type::FINISH);
+        delay(100); 
+        ESP.restart();
 
-            float moisture = 1 - analogRead(MOISTURE_SENSOR_PIN) / 4095.0;
-            server.printf("DATA|%.1f|%.1f|%.3f\n", temperature, humidity, moisture);
-            Serial.printf("temperature: %.1f, humidity: %.1f, moisture: %.3f\n", temperature, humidity, moisture);
-        }
-
-        else if (args[0] == "LIGHT" && args.size() >= 2) {
-            int previousState = digitalRead(LIGHT_PIN);
-            int state = args[1] == "ON" ? HIGH : LOW;
-
-            digitalWrite(LIGHT_PIN, state);
-
-            if (previousState && !state) {
-                log("INFO", "Restarting");
-                delay(500);
-                ESP.restart();
-            }
-        }
-
-        else {
-            log("WARN", "Unknown command: " + message);
-        }
+        break;
     }
 
-    server.println("HEARTBEAT");
-    delay(1000);
+    case Type::READY:
+    case Type::REJECT:
+    case Type::CANCEL:
+    case Type::ACK:
+    default: break;
+
+  }
+
+  delete pkt;
+
 }
 
-// === SETUP ===
+void setup(){
 
-void setup() {
-    Serial.begin(115200);
+  WiFi.mode(WIFI_STA); WiFi.disconnect();
+  if(esp_now_init() != ESP_OK) ESP.restart();
 
-    pinMode(PUMP_PIN, OUTPUT);
-    pinMode(LIGHT_PIN, OUTPUT);
-    pinMode(DHT_PIN, INPUT);
-    pinMode(MOISTURE_SENSOR_PIN, INPUT);
+  esp_now_register_recv_cb(onRecv);
 
-    dht.begin();
+  uint8_t senderMac[6]  = {0xE4, 0x65, 0xB8, 0x7E, 0x22, 0x50};
+  esp_now_peer_info_t p={0}; memcpy(p.peer_addr, senderMac, 6); p.channel=0; p.encrypt=false; esp_now_add_peer(&p);
 
-    connectToWiFi();
-    connectToServer();
-
-    esp_reset_reason_t reason = esp_reset_reason();
-    log("INFO", "Booting... Last reset reason: " + String(get_reset_reason(reason)));
 }
+
+void loop() {}

@@ -4,18 +4,22 @@
 #include <mbedtls/sha256.h>
 #include "Packet.h"
 #include <Arduino.h>
+#include <stdarg.h>
 
-// Debug print function with timestamp and color
-void debugPrint(const char* format, ...){
-    va_list args;
-    va_start(args, format);
-    Serial.print("[");
-    Serial.print(millis());
-    Serial.print(" ms] ");
-    vprintf(format, args);
-    Serial.println();
-    va_end(args);
+void debugPrint(const char* fmt, ...) {
+  char buf[256];                   // adjust if needed
+  va_list args;
+  va_start(args, fmt);
+  vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+
+  Serial.print("[");
+  Serial.print(millis());
+  Serial.print(" ms] ");
+  Serial.print(buf);
+  Serial.println();
 }
+
 
 // Global variables
 static uint32_t expectedSeq=0;
@@ -57,7 +61,7 @@ static void sendControl(const uint8_t* mac, Type t) {
   esp_now_send(mac, buf, len);
 }
 
-void onRecv(const uint8_t* mac,const uint8_t* data,int len) {
+void onRecv(const uint8_t* mac, const uint8_t* data, int len) {
     debugPrint("Packet received from %02X:%02X:%02X:%02X:%02X:%02X, length=%d", 
                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5], len);
 
@@ -89,8 +93,8 @@ void onRecv(const uint8_t* mac,const uint8_t* data,int len) {
                 mbedtls_sha256_starts_ret(&sha, 0); 
                 hashing=true;
                 debugPrint("SHA-256 hashing initiated");
-                sendControl(mac, Type::FINISH);
-                debugPrint("Sent FINISH control packet");
+                sendControl(mac, Type::READY);
+                debugPrint("Sent READY control packet");
             } else {
                 debugPrint("Failed to begin update");
                 sendControl(mac, Type::REJECT);
